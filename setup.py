@@ -21,6 +21,7 @@ setup(name='cbpi4-ESPHome-Actor',
       packages=['cbpi4-ESPHome-Actor'],
       install_requires=[
             'cbpi4>=4.0.0.34',
+            'aioesphomeapi',
       ],
       long_description=long_description,
       long_description_content_type='text/markdown'
