@@ -147,7 +147,7 @@ class ESPHomeActor(CBPiActor):
             logger.warning("[ESPHomeActor] _set_switch called but not connected; skipping")
             return
         try:
-            await self.client.switch_command(key=self.entity_key, state=on)
+            self.client.switch_command(key=self.entity_key, state=on)  # géén await
             logger.info(f"[ESPHomeActor] switch_command verzonden: key={self.entity_key}, state={on}")
         except Exception as e:
             logger.exception(f"[ESPHomeActor] switch_command error: {e}")
@@ -155,9 +155,9 @@ class ESPHomeActor(CBPiActor):
             try:
                 await self.client.disconnect()
             except Exception:
-                pass  # was toch al kapot, geen probleem als disconnect ook faalt
+                pass
 
-    async def on(self, power=None):
+    async def on(self, power=None, *args, **kwargs):
         """Requested to turn actor ON (via CBPi UI / script)."""
         self.state = True
         await self._set_switch(True)
@@ -166,7 +166,7 @@ class ESPHomeActor(CBPiActor):
         except Exception:
             pass
 
-    async def off(self):
+    async def off(self, *args, **kwargs):
         """Requested to turn actor OFF (via CBPi UI / script)."""
         self.state = False
         await self._set_switch(False)
@@ -174,7 +174,7 @@ class ESPHomeActor(CBPiActor):
             await self.cbpi.actor.actor_update(self.id, 0)
         except Exception:
             pass
-
+        
     async def run(self):
         """Geen PWM meer — actor is puur aan/uit, gestuurd via on()/off()."""
         while True:
