@@ -5,6 +5,113 @@ from aioesphomeapi import APIClient, APIConnectionError
 
 logger = logging.getLogger("cbpi4-ESPHome-Actor")
 
+# Dictionairy waarin we actieve verbindingen per ESP bewaren: { "192.168.1.50:6053": ESPHomeManager }
+_MANAGERS = {}
+
+
+class ESPHomeManager:
+    """Beheert ÉÉN enkele APIClient verbinding per ESPHome node voor meerdere actors."""
+
+    def __init__(self, host, port, encryption_key, timeout=5):
+        self.host = host
+        self.port = port
+        self.encryption_key = encryption_key
+        self.timeout = timeout
+
+        self.client = APIClient(
+            self.host, self.port, password="", noise_psk=self.encryption_key
+        )
+        self.connected = False
+        self.connect_task = None
+        self.actors = {}  # { actor_id: ESPHomeActor }
+        self.entities = []
+        self.running = True
+
+    async def start(self):
+        if not self.connect_task:
+            self.connect_task = asyncio.create_task(self._connect_loop())
+
+    def register_actor(self, actor):
+        self.actors[actor.id] = actor
+        if self.connected and self.entities:
+            self._resolve_actor_key(actor)
+
+    def unregister_actor(self, actor):
+        if actor.id in self.actors:
+            del self.actors[actor.id]
+
+    def _resolve_actor_key(self, actor):
+        actor.entity_key = None
+        for e in self.entities:
+            if e.name == actor.entity_name or getattr(e, "object_id", None) == actor.entity_name:
+                actor.entity_key = e.key
+                logger.info(f"[ESPHomeManager] Entity '{actor.entity_name}' gekoppeld aan key {e.key} ({self.host})")
+                break
+
+        if actor.entity_key is None:
+            logger.error(f"[ESPHomeManager] Entity '{actor.entity_name}' niet gevonden op {self.host}")
+
+    async def _connect_loop(self):
+        logger.debug(f"[ESPHomeManager] Verbinder-loop gestart voor {self.host}")
+
+        while self.running:
+            if not self.connected:
+                try:
+                    await self.client.connect(login=True)
+                    self.entities, _ = await self.client.list_entities_services()
+
+                    # Koppel entity keys voor alle geregistreerde actors op deze ESP
+                    for actor in list(self.actors.values()):
+                        self._resolve_actor_key(actor)
+
+                    self.client.subscribe_states(self._on_state)
+                    self.connected = True
+                    logger.info(f"[ESPHomeManager] Verbonden met {self.host}")
+
+                except (APIConnectionError, OSError, TimeoutError) as e:
+                    if "Already connected" in str(e):
+                        self.connected = True
+                        await asyncio.sleep(1)
+                        continue
+
+                    logger.error(f"[ESPHomeManager] Verbindingsfout ({self.host}): {e}")
+                    self.connected = False
+                    await asyncio.sleep(self.timeout)
+                    continue
+
+            await asyncio.sleep(1)
+
+    def _on_state(self, state):
+        key = getattr(state, "key", None)
+        if key is None or not hasattr(state, "state"):
+            return
+
+        # Stuur statusupdate door naar de juiste actor
+        for actor in list(self.actors.values()):
+            if actor.entity_key == key:
+                actor.handle_external_state(bool(state.state))
+
+    def set_switch(self, entity_key, state: bool):
+        if not self.connected or entity_key is None:
+            logger.warning(f"[ESPHomeManager] Kan commando niet sturen naar {self.host}: niet verbonden")
+            return
+        try:
+            self.client.switch_command(key=entity_key, state=state)
+            logger.info(f"[ESPHomeManager] Commando verzonden: key={entity_key}, state={state}")
+        except Exception as e:
+            logger.exception(f"[ESPHomeManager] switch_command error op {self.host}: {e}")
+            self.connected = False
+
+    async def stop(self):
+        self.running = False
+        if self.connect_task:
+            self.connect_task.cancel()
+        if self.client:
+            try:
+                await self.client.disconnect()
+            except Exception:
+                pass
+
 
 @parameters([
     Property.Text(
@@ -38,7 +145,6 @@ logger = logging.getLogger("cbpi4-ESPHome-Actor")
 class ESPHomeActor(CBPiActor):
 
     def __init__(self, cbpi, id, props):
-        """Guaranteed to run before any other lifecycle method — use for safe defaults."""
         super().__init__(cbpi, id, props)
 
         self.host = None
@@ -47,19 +153,10 @@ class ESPHomeActor(CBPiActor):
         self.entity_name = None
         self.entity_key = None
 
-        self.timeout = 5
-
         self.state = False
-
-        self.client = None
-        self.connected = False
-
-        self._connect_task = None
-
-        logger.debug("[ESPHomeActor] __init__ completed (defaults set)")
+        self.manager = None
 
     async def on_start(self):
-        """Called when plugin is started/initialized by CBPi."""
         try:
             self.host = (self.props.get("Host") or "").strip()
             if not self.host:
@@ -73,136 +170,67 @@ class ESPHomeActor(CBPiActor):
                 logger.error("[ESPHomeActor] Missing Entity Name")
                 return
 
-            self.timeout = int(self.props.get("Request Timeout") or 5)
+            timeout = int(self.props.get("Request Timeout") or 5)
 
-            self.client = APIClient(self.host, self.port, password="", noise_psk=self.encryption_key)
+            # Haal de gedeelde manager op of maak een nieuwe aan per Host:Port
+            manager_key = f"{self.host}:{self.port}"
+            if manager_key not in _MANAGERS:
+                _MANAGERS[manager_key] = ESPHomeManager(self.host, self.port, self.encryption_key, timeout)
+                await _MANAGERS[manager_key].start()
 
-            logger.info(f"[ESPHomeActor] on_start: entity={self.entity_name}, host={self.host}:{self.port}")
+            self.manager = _MANAGERS[manager_key]
+            self.manager.register_actor(self)
 
-            self._connect_task = asyncio.create_task(self.connect_loop())
+            logger.info(f"[ESPHomeActor] Aangemeld bij manager {manager_key} voor entity '{self.entity_name}'")
 
         except Exception as e:
             logger.exception(f"[ESPHomeActor] Exception in on_start: {e}")
 
-    async def connect_loop(self):
-        await asyncio.sleep(1)
-        logger.debug("[ESPHomeActor] connect_loop started")
-
-        while True:
-            if not self.connected:
-                try:
-                    await self.client.connect(login=True)
-                    entities, _ = await self.client.list_entities_services()
-
-                    self.entity_key = None
-                    for e in entities:
-                        if e.name == self.entity_name or getattr(e, "object_id", None) == self.entity_name:
-                            self.entity_key = e.key
-                            break
-
-                    if self.entity_key is None:
-                        logger.error(f"[ESPHomeActor] Entity '{self.entity_name}' niet gevonden op {self.host}")
-                        await self.client.disconnect()
-                        await asyncio.sleep(self.timeout)
-                        continue
-
-                    self.client.subscribe_states(self._on_state)
-                    self.connected = True
-                    logger.info(f"[ESPHomeActor] Verbonden met {self.host}, entity key {self.entity_key}")
-
-                except (APIConnectionError, OSError, TimeoutError) as e:
-                    if "Already connected" in str(e):
-                        # De socket leeft nog, alleen onze lokale vlag was verouderd.
-                        logger.warning(f"[ESPHomeActor] Verbinding bleek nog actief te zijn, status hersteld")
-                        self.connected = True
-                        await asyncio.sleep(1)
-                        continue
-
-                    logger.error(f"[ESPHomeActor] Verbindingsfout ({self.host}): {e}")
-                    self.connected = False
-                    await asyncio.sleep(self.timeout)
-                    continue
-
-            await asyncio.sleep(1)
-
-    def _on_state(self, state):
-        """Reflect externally-changed state (e.g. physical button) back into CBPi."""
-        if getattr(state, "key", None) != self.entity_key:
-            return
-        if not hasattr(state, "state"):
-            return
-
-        new_state = bool(state.state)
+    def handle_external_state(self, new_state: bool):
+        """Wordt aangeroepen door de Manager bij een statuswijziging vanuit ESPHome."""
         if new_state != self.state:
-            logger.info(f"[ESPHomeActor] Externe statuswijziging -> {new_state}")
+            logger.info(f"[ESPHomeActor] Externe statuswijziging ({self.entity_name}) -> {new_state}")
             self.state = new_state
             try:
                 asyncio.create_task(self.cbpi.actor.actor_update(self.id, 100 if new_state else 0))
             except Exception as e:
                 logger.debug(f"[ESPHomeActor] actor_update failed: {e}")
 
-    async def _set_switch(self, on: bool):
-        """Send a switch command directly to the ESPHome node."""
-        if not self.connected or self.entity_key is None:
-            logger.warning("[ESPHomeActor] _set_switch called but not connected; skipping")
-            return
-        try:
-            self.client.switch_command(key=self.entity_key, state=on)  # géén await
-            logger.info(f"[ESPHomeActor] switch_command verzonden: key={self.entity_key}, state={on}")
-        except Exception as e:
-            logger.exception(f"[ESPHomeActor] switch_command error: {e}")
-            self.connected = False
-            try:
-                await self.client.disconnect()
-            except Exception:
-                pass
-
     async def on(self, power=None, *args, **kwargs):
-        """Requested to turn actor ON (via CBPi UI / script)."""
         self.state = True
-        await self._set_switch(True)
+        if self.manager and self.entity_key is not None:
+            self.manager.set_switch(self.entity_key, True)
         try:
             await self.cbpi.actor.actor_update(self.id, 100)
         except Exception:
             pass
 
     async def off(self, *args, **kwargs):
-        """Requested to turn actor OFF (via CBPi UI / script)."""
         self.state = False
-        await self._set_switch(False)
+        if self.manager and self.entity_key is not None:
+            self.manager.set_switch(self.entity_key, False)
         try:
             await self.cbpi.actor.actor_update(self.id, 0)
         except Exception:
             pass
-        
+
     async def run(self):
-        """Geen PWM meer — actor is puur aan/uit, gestuurd via on()/off()."""
         while True:
             await asyncio.sleep(1)
 
     def get_state(self):
-        """Return boolean state for CBPi UI."""
         return bool(self.state)
 
     async def on_shutdown(self):
-        """Cleanup: cancel connect task and close ESPHome connection."""
-        logger.info("[ESPHomeActor] on_shutdown called — cleaning up")
-        if self._connect_task:
-            self._connect_task.cancel()
-            try:
-                await self._connect_task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.debug(f"[ESPHomeActor] connect_task cancellation error: {e}")
-
-        if self.client:
-            try:
-                await self.client.disconnect()
-            except Exception as e:
-                logger.debug(f"[ESPHomeActor] disconnect error: {e}")
-
-        logger.info("[ESPHomeActor] cleanup done")
+        logger.info(f"[ESPHomeActor] Afmelden van actor {self.entity_name}")
+        if self.manager:
+            self.manager.unregister_actor(self)
+            # Als er geen actors meer gekoppeld zijn aan deze manager, sluiten we de verbinding netjes af
+            if not self.manager.actors:
+                manager_key = f"{self.host}:{self.port}"
+                logger.info(f"[ESPHomeActor] Geen actieve actors meer voor {manager_key}, verbinding wordt gesloten.")
+                await self.manager.stop()
+                _MANAGERS.pop(manager_key, None)
 
 
 def setup(cbpi):
