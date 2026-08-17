@@ -85,7 +85,6 @@ class ESPHomeActor(CBPiActor):
             logger.exception(f"[ESPHomeActor] Exception in on_start: {e}")
 
     async def connect_loop(self):
-        """Maintain connection to the ESPHome node, resolve entity key, subscribe to state changes."""
         await asyncio.sleep(1)
         logger.debug("[ESPHomeActor] connect_loop started")
 
@@ -112,6 +111,13 @@ class ESPHomeActor(CBPiActor):
                     logger.info(f"[ESPHomeActor] Verbonden met {self.host}, entity key {self.entity_key}")
 
                 except (APIConnectionError, OSError, TimeoutError) as e:
+                    if "Already connected" in str(e):
+                        # De socket leeft nog, alleen onze lokale vlag was verouderd.
+                        logger.warning(f"[ESPHomeActor] Verbinding bleek nog actief te zijn, status hersteld")
+                        self.connected = True
+                        await asyncio.sleep(1)
+                        continue
+
                     logger.error(f"[ESPHomeActor] Verbindingsfout ({self.host}): {e}")
                     self.connected = False
                     await asyncio.sleep(self.timeout)
@@ -142,9 +148,14 @@ class ESPHomeActor(CBPiActor):
             return
         try:
             await self.client.switch_command(key=self.entity_key, state=on)
+            logger.info(f"[ESPHomeActor] switch_command verzonden: key={self.entity_key}, state={on}")
         except Exception as e:
             logger.exception(f"[ESPHomeActor] switch_command error: {e}")
-            self.connected = False  # forceer reconnect
+            self.connected = False
+            try:
+                await self.client.disconnect()
+            except Exception:
+                pass  # was toch al kapot, geen probleem als disconnect ook faalt
 
     async def on(self, power=None):
         """Requested to turn actor ON (via CBPi UI / script)."""
